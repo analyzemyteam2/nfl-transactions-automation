@@ -1,219 +1,98 @@
 name: Daily NFL Transaction Scraper
 
 on:
-  schedule:
-    - cron: '0 14 * * *'
   workflow_dispatch:
-    inputs:
-      test_mode:
-        description: 'Run in test mode'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   scrape-nfl-transactions:
     runs-on: ubuntu-latest
     
     steps:
-    - name: 🏈 Checkout Repository
+    - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: 🐍 Set up Python
+    - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-        cache: 'pip'
 
-    - name: 📦 Install Dependencies
+    - name: Install Dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install requests pandas beautifulsoup4 python-dotenv retry lxml
+        pip install requests beautifulsoup4 pandas
 
-    - name: 🏈 Run Spotrac NFL Transaction Scraper
+    - name: Test Spotrac Connection
+      run: |
+        python -c "
+        import requests
+        from bs4 import BeautifulSoup
+        
+        print('🏈 Testing Spotrac connection...')
+        
+        try:
+            url = 'https://www.spotrac.com/nfl/transactions'
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            print(f'Status Code: {response.status_code}')
+            print(f'Content Length: {len(response.text)}')
+            
+            if 'transaction' in response.text.lower():
+                print('✅ Found transaction data on Spotrac!')
+            else:
+                print('⚠️ No transaction data found')
+                
+        except Exception as e:
+            print(f'❌ Error: {e}')
+        "
+
+    - name: Test Airtable Connection
       env:
         AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
         AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
         AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
       run: |
-        echo "🚀 Starting NFL transaction automation with Spotrac scraper..."
-        
         python -c "
-import sys
-sys.path.append('src')
-import requests
-import pandas as pd
-from datetime import datetime
-import re
-import os
-from bs4 import BeautifulSoup
-
-print('🔧 Starting Spotrac NFL Transaction Scraper...')
-
-# Spotrac scraper class
-class SpotracScraper:
-    def __init__(self):
-        self.base_url = 'https://www.spotrac.com/nfl/transactions'
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-    
-    def fetch_transactions(self):
-        try:
-            response = requests.get(self.base_url, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text = response.text
-            
-            transactions = []
-            lines = text.split('\n')
-            
-            current_player = None
-            current_position = None
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                # Look for player lines
-                player_match = re.search(r'^([^(]+)\s*\(([^)]+)\)\s*$', line)
-                if player_match:
-                    current_player = player_match.group(1).strip()
-                    current_position = player_match.group(2).strip()
-                    continue
-                
-                # Look for transaction lines
-                if current_player and re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+,\s+\d+\s*-', line):
-                    parsed = self.parse_transaction(line, current_player, current_position)
-                    if parsed:
-                        transactions.append(parsed)
-                    current_player = None
-                    current_position = None
-            
-            return transactions
-            
-        except Exception as e:
-            print(f'❌ Error fetching from Spotrac: {e}')
-            return []
-    
-    def parse_transaction(self, line, player, position):
-        try:
-            # Extract date
-            date_match = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+),\s+(\d+)', line)
-            if not date_match:
-                return None
-            
-            month_str, day, year = date_match.groups()
-            month_num = {
-                'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
-            }[month_str]
-            
-            date_str = f'{year}-{month_num:02d}-{int(day):02d}'
-            
-            # Extract description
-            dash_index = line.find(' - ')
-            if dash_index == -1:
-                return None
-            
-            description = line[dash_index + 3:].strip()
-            
-            # Extract team
-            team_match = re.search(r'with\s+([^(]+)\s*\(([^)]+)\)', description)
-            team = team_match.group(1).strip() if team_match else 'Unknown'
-            
-            # Classify transaction type
-            desc_lower = description.lower()
-            if 'signed' in desc_lower and 'extension' in desc_lower:
-                trans_type = 'Contract Extension'
-            elif 'signed' in desc_lower:
-                trans_type = 'Signing'
-            elif 'traded' in desc_lower:
-                trans_type = 'Trade'
-            elif 'released' in desc_lower:
-                trans_type = 'Release'
-            else:
-                trans_type = 'Other'
-            
-            return {
-                'date': date_str,
-                'type': trans_type,
-                'team': team,
-                'player': player,
-                'position': position,
-                'description': description,
-                'transaction_id': f'SPOTRAC_{date_str}_{player.replace(\" \", \"_\")}_{hash(description) % 10000:04d}',
-                'scraped_at': datetime.now().isoformat(),
-                'source': 'Spotrac'
-            }
-            
-        except Exception as e:
-            print(f'❌ Error parsing transaction: {e}')
-            return None
-
-# Run the scraper
-scraper = SpotracScraper()
-transactions = scraper.fetch_transactions()
-
-print(f'📊 Found {len(transactions)} NFL transactions from Spotrac')
-
-# Airtable integration
-access_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
-base_id = os.getenv('AIRTABLE_BASE_ID')
-table_name = os.getenv('AIRTABLE_TABLE_NAME')
-
-if not access_token or not base_id or not table_name:
-    print('❌ Airtable credentials missing')
-    exit(1)
-
-print('🔗 Airtable credentials configured')
-
-url = f'https://api.airtable.com/v0/{base_id}/{table_name}'
-headers = {
-    'Authorization': f'Bearer {access_token}',
-    'Content-Type': 'application/json'
-}
-
-if transactions:
-    print('📊 Sending transactions to Airtable...')
-    success_count = 0
-    
-    for transaction in transactions[:10]:  # Limit to 10 for testing
-        data = {
-            'fields': {
-                'Date': transaction['date'],
-                'Type': transaction['type'],
-                'Team': transaction['team'],
-                'Player': transaction['player'],
-                'Description': transaction['description'],
-                'Transaction ID': transaction['transaction_id'],
-                'Source': 'Spotrac'
-            }
-        }
+        import requests
+        import os
+        from datetime import datetime
         
-        try:
-            response = requests.post(url, json=data, headers=headers)
-            if response.status_code == 200:
-                print(f'  ✅ Added: {transaction[\"type\"]} - {transaction[\"team\"]} - {transaction[\"player\"]}')
-                success_count += 1
-            else:
-                print(f'  ❌ Failed: {response.status_code}')
-        except Exception as e:
-            print(f'  ❌ Error: {e}')
-    
-    print(f'🏆 Successfully sent {success_count} transactions to Airtable!')
-else:
-    print('📭 No transactions found')
-
-print('🏁 Spotrac NFL automation completed!')
-"
-
-    - name: 📊 Generate Summary
-      if: always()
-      run: |
-        echo "## 🏈 NFL Transaction Automation Summary" >> $GITHUB_STEP_SUMMARY
-        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
-        echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Source:** Spotrac.com NFL Transactions" >> $GITHUB_STEP_SUMMARY
+        print('🔗 Testing Airtable connection...')
+        
+        token = os.getenv('AIRTABLE_ACCESS_TOKEN', '')
+        base_id = os.getenv('AIRTABLE_BASE_ID', '')
+        table_name = os.getenv('AIRTABLE_TABLE_NAME', '')
+        
+        print(f'Token exists: {bool(token)}')
+        print(f'Base ID exists: {bool(base_id)}')
+        print(f'Table name exists: {bool(table_name)}')
+        
+        if token and base_id and table_name:
+            url = f'https://api.airtable.com/v0/{base_id}/{table_name}'
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
+            
+            test_data = {
+                'fields': {
+                    'Date': '2025-01-03',
+                    'Type': 'Test',
+                    'Team': 'GitHub Actions',
+                    'Player': 'Connection Test',
+                    'Description': 'Testing workflow connection to Airtable',
+                    'Transaction ID': f'TEST_{datetime.now().strftime(\"%Y%m%d%H%M\")}',
+                    'Source': 'Workflow Test'
+                }
+            }
+            
+            try:
+                response = requests.post(url, json=test_data, headers=headers)
+                if response.status_code == 200:
+                    print('✅ Successfully added test record to Airtable!')
+                else:
+                    print(f'❌ Airtable error: {response.status_code} - {response.text}')
+            except Exception as e:
+                print(f'❌ Airtable connection error: {e}')
+        else:
+            print('❌ Missing Airtable credentials')
+        "
