@@ -40,45 +40,151 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: 🔐 Setup Google Credentials
-      env:
-        GOOGLE_CREDENTIALS_BASE64: ${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}
-      run: |
-        # Create credentials directory
-        mkdir -p credentials
-        
-        # Decode and save Google credentials
-        echo "$GOOGLE_CREDENTIALS_BASE64" | base64 -d > credentials/google_credentials.json
-        
-        # Set environment variable
-        echo "GOOGLE_CREDENTIALS_PATH=credentials/google_credentials.json" >> $GITHUB_ENV
-
     - name: 🧪 Test System Connectivity
       if: ${{ inputs.test_mode }}
-      env:
-        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
         echo "🧪 Running connectivity tests..."
-        python src/main.py test
+        python -c "
+import requests
+print('🔍 Testing ESPN API...')
+try:
+    response = requests.get('https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/transactions?limit=1')
+    if response.status_code == 200:
+        print('✅ ESPN API: Connected')
+    else:
+        print(f'⚠️ ESPN API: Status {response.status_code}')
+except Exception as e:
+    print(f'❌ ESPN API: {e}')
 
-    - name: 🏈 Run NFL Transaction Scraper
+print('🔍 Testing Airtable credentials...')
+import os
+token = os.getenv('AIRTABLE_ACCESS_TOKEN', '')
+base_id = os.getenv('AIRTABLE_BASE_ID', '')
+table_name = os.getenv('AIRTABLE_TABLE_NAME', '')
+print(f'Token: {\"✅\" if token else \"❌\"}')
+print(f'Base ID: {\"✅\" if base_id else \"❌\"}')
+print(f'Table Name: {\"✅\" if table_name else \"❌\"}')
+"
+      env:
+        AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+        AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+
+    - name: 🏈 Run NFL Transaction Scraper and Send to Airtable
       if: ${{ !inputs.test_mode }}
       env:
-        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-        ESPN_API_BASE_URL: 'https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/transactions'
+        AIRTABLE_ACCESS_TOKEN: ${{ secrets.AIRTABLE_ACCESS_TOKEN }}
+        AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
       run: |
-        echo "🚀 Starting NFL transaction automation..."
-        if [ -n "${{ inputs.date }}" ]; then
-          echo "📅 Processing specific date: ${{ inputs.date }}"
-          python src/main.py ${{ inputs.date }}
-        else
-          echo "📅 Processing today's transactions"
-          python src/main.py
-        fi
+        echo "🚀 Starting NFL transaction automation with direct Airtable integration..."
+        
+        python -c "
+import sys
+sys.path.append('src')
+from transaction_scraper import NFLTransactionScraper
+import requests
+import json
+import os
+from datetime import datetime
+
+print('🔧 Initializing NFL Transaction Scraper...')
+
+# Initialize scraper
+scraper = NFLTransactionScraper()
+
+# Get today's transactions (or specific date if provided)
+date_param = '${{ inputs.date }}' if '${{ inputs.date }}' else None
+df = scraper.get_daily_transactions(date_param)
+
+print(f'📊 Found {len(df)} NFL transactions')
+
+# Airtable configuration
+access_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+base_id = os.getenv('AIRTABLE_BASE_ID')
+table_name = os.getenv('AIRTABLE_TABLE_NAME')
+
+if not access_token or not base_id or not table_name:
+    print('❌ Airtable credentials not configured properly')
+    print(f'Token: {\"✅\" if access_token else \"❌\"}')
+    print(f'Base ID: {\"✅\" if base_id else \"❌\"}') 
+    print(f'Table Name: {\"✅\" if table_name else \"❌\"}')
+    exit(1)
+
+print('🔗 Airtable credentials configured successfully')
+
+url = f'https://api.airtable.com/v0/{base_id}/{table_name}'
+headers = {
+    'Authorization': f'Bearer {access_token}',
+    'Content-Type': 'application/json'
+}
+
+if not df.empty:
+    # Save CSV backup
+    filename = scraper.save_to_csv(df)
+    print(f'💾 Saved backup to: {filename}')
+    
+    # Send each transaction to Airtable
+    print('📊 Sending transactions to Airtable...')
+    
+    success_count = 0
+    for index, row in df.iterrows():
+        data = {
+            'fields': {
+                'Date': row['date'],
+                'Type': row['type'],
+                'Team': row['team'],
+                'Player': row['player'],
+                'Description': row['description'],
+                'Transaction ID': row['transaction_id'],
+                'Source': 'ESPN API',
+                'Imported At': row['scraped_at']
+            }
+        }
+        
+        try:
+            response = requests.post(url, json=data, headers=headers)
+            if response.status_code == 200:
+                print(f'  ✅ Added: {row[\"type\"]} - {row[\"team\"]} - {row[\"player\"]}')
+                success_count += 1
+            else:
+                print(f'  ❌ Failed: {response.status_code} - {response.text}')
+        except Exception as e:
+            print(f'  ❌ Error: {e}')
+    
+    print(f'🏆 Successfully sent {success_count}/{len(df)} transactions to Airtable!')
+else:
+    print('📭 No NFL transactions found for today (normal during quiet periods)')
+    
+    # Send daily status update to confirm system is working
+    status_data = {
+        'fields': {
+            'Date': datetime.now().strftime('%Y-%m-%d'),
+            'Type': 'System Status',
+            'Team': 'Automation',
+            'Player': 'Daily Check',
+            'Description': f'Daily ESPN API check completed at {datetime.now().strftime(\"%Y-%m-%d %H:%M UTC\")} - No new transactions found',
+            'Transaction ID': f'STATUS_{datetime.now().strftime(\"%Y%m%d\")}',
+            'Source': 'GitHub Actions',
+            'Imported At': datetime.now().isoformat()
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=status_data, headers=headers)
+        if response.status_code == 200:
+            print('📊 ✅ Sent daily status update to Airtable')
+        else:
+            print(f'📊 ❌ Status update failed: {response.status_code}')
+    except Exception as e:
+        print(f'❌ Error sending status: {e}')
+
+print('🏁 NFL transaction automation completed!')
+"
 
     - name: 📊 Upload Transaction Data
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: nfl-transactions-${{ github.run_number }}
         path: |
@@ -133,8 +239,8 @@ jobs:
         echo "❌ NFL Transaction automation failed!"
         echo "Check the logs for details and verify:"
         echo "1. ESPN API is accessible"
-        echo "2. Google Sheets credentials are valid"
-        echo "3. Google Sheet ID is correct"
+        echo "2. Airtable credentials are valid"
+        echo "3. Airtable Base ID and Table Name are correct"
         echo "4. All required secrets are configured"
 
   notify-status:
@@ -143,33 +249,13 @@ jobs:
     if: always()
     
     steps:
-    - name: 📧 Send Status Notification
-      if: env.SLACK_WEBHOOK_URL != ''
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    - name: 📊 Log Automation Status
       run: |
         if [ "${{ needs.scrape-nfl-transactions.result }}" = "success" ]; then
-          STATUS="✅ SUCCESS"
-          COLOR="good"
-          MESSAGE="NFL transaction automation completed successfully!"
+          echo "✅ NFL transaction automation completed successfully!"
+          echo "📊 Data sent to Airtable: Denauld Brown Consulting > Transactions"
+          echo "🔄 Next run: Tomorrow at 9:00 AM EST"
         else
-          STATUS="❌ FAILED"
-          COLOR="danger"
-          MESSAGE="NFL transaction automation failed. Check GitHub Actions logs."
+          echo "❌ NFL transaction automation failed!"
+          echo "🔧 Check logs and verify Airtable credentials"
         fi
-        
-        curl -X POST -H 'Content-type: application/json' \
-        --data "{
-          \"attachments\": [{
-            \"color\": \"$COLOR\",
-            \"title\": \"🏈 NFL Transaction Automation\",
-            \"text\": \"$MESSAGE\",
-            \"fields\": [
-              {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
-              {\"title\": \"Date\", \"value\": \"$(date -u '+%Y-%m-%d %H:%M UTC')\", \"short\": true},
-              {\"title\": \"Repository\", \"value\": \"${{ github.repository }}\", \"short\": true},
-              {\"title\": \"Run ID\", \"value\": \"${{ github.run_id }}\", \"short\": true}
-            ]
-          }]
-        }" \
-        $SLACK_WEBHOOK_URL
