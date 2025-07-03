@@ -1,0 +1,175 @@
+name: Daily NFL Transaction Scraper
+
+on:
+  schedule:
+    # Run daily at 2:00 PM UTC (9:00 AM EST)
+    - cron: '0 14 * * *'
+  workflow_dispatch:  # Allow manual triggering
+    inputs:
+      date:
+        description: 'Date to scrape (YYYY-MM-DD, optional)'
+        required: false
+        type: string
+      test_mode:
+        description: 'Run in test mode'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  scrape-nfl-transactions:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 🏈 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: 🔐 Setup Google Credentials
+      env:
+        GOOGLE_CREDENTIALS_BASE64: ${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}
+      run: |
+        # Create credentials directory
+        mkdir -p credentials
+        
+        # Decode and save Google credentials
+        echo "$GOOGLE_CREDENTIALS_BASE64" | base64 -d > credentials/google_credentials.json
+        
+        # Set environment variable
+        echo "GOOGLE_CREDENTIALS_PATH=credentials/google_credentials.json" >> $GITHUB_ENV
+
+    - name: 🧪 Test System Connectivity
+      if: ${{ inputs.test_mode }}
+      env:
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      run: |
+        echo "🧪 Running connectivity tests..."
+        python src/main.py test
+
+    - name: 🏈 Run NFL Transaction Scraper
+      if: ${{ !inputs.test_mode }}
+      env:
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        ESPN_API_BASE_URL: 'https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/transactions'
+      run: |
+        echo "🚀 Starting NFL transaction automation..."
+        if [ -n "${{ inputs.date }}" ]; then
+          echo "📅 Processing specific date: ${{ inputs.date }}"
+          python src/main.py ${{ inputs.date }}
+        else
+          echo "📅 Processing today's transactions"
+          python src/main.py
+        fi
+
+    - name: 📊 Upload Transaction Data
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: nfl-transactions-${{ github.run_number }}
+        path: |
+          data/*.csv
+          logs/*.log
+        retention-days: 30
+
+    - name: 📝 Commit Updated Data
+      if: success()
+      run: |
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "NFL Transaction Bot"
+        
+        # Add any new data files
+        git add data/ || true
+        git add logs/ || true
+        
+        # Commit if there are changes
+        if git diff --staged --quiet; then
+          echo "📭 No new data to commit"
+        else
+          git commit -m "📊 Daily NFL transaction update - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
+          echo "✅ Successfully committed new transaction data"
+        fi
+
+    - name: 📈 Generate Summary Report
+      if: always()
+      run: |
+        echo "## 🏈 NFL Transaction Automation Summary" >> $GITHUB_STEP_SUMMARY
+        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+        echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f "logs/nfl_automation.log" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Latest Log Entries:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          tail -20 logs/nfl_automation.log >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -d "data" ] && [ "$(ls -A data)" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Data Files Created:" >> $GITHUB_STEP_SUMMARY
+          ls -la data/ >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: 🚨 Notify on Failure
+      if: failure()
+      run: |
+        echo "❌ NFL Transaction automation failed!"
+        echo "Check the logs for details and verify:"
+        echo "1. ESPN API is accessible"
+        echo "2. Google Sheets credentials are valid"
+        echo "3. Google Sheet ID is correct"
+        echo "4. All required secrets are configured"
+
+  notify-status:
+    runs-on: ubuntu-latest
+    needs: scrape-nfl-transactions
+    if: always()
+    
+    steps:
+    - name: 📧 Send Status Notification
+      if: env.SLACK_WEBHOOK_URL != ''
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        if [ "${{ needs.scrape-nfl-transactions.result }}" = "success" ]; then
+          STATUS="✅ SUCCESS"
+          COLOR="good"
+          MESSAGE="NFL transaction automation completed successfully!"
+        else
+          STATUS="❌ FAILED"
+          COLOR="danger"
+          MESSAGE="NFL transaction automation failed. Check GitHub Actions logs."
+        fi
+        
+        curl -X POST -H 'Content-type: application/json' \
+        --data "{
+          \"attachments\": [{
+            \"color\": \"$COLOR\",
+            \"title\": \"🏈 NFL Transaction Automation\",
+            \"text\": \"$MESSAGE\",
+            \"fields\": [
+              {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+              {\"title\": \"Date\", \"value\": \"$(date -u '+%Y-%m-%d %H:%M UTC')\", \"short\": true},
+              {\"title\": \"Repository\", \"value\": \"${{ github.repository }}\", \"short\": true},
+              {\"title\": \"Run ID\", \"value\": \"${{ github.run_id }}\", \"short\": true}
+            ]
+          }]
+        }" \
+        $SLACK_WEBHOOK_URL
